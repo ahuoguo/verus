@@ -101,11 +101,12 @@ pub(crate) enum SpecItem {
     DecreasesWhen,
     DecreasesBy,
     RecommendsBy,
-    OpensInvariantsNone,
-    OpensInvariantsAny,
-    OpensInvariants,
-    OpensInvariantsExcept,
-    OpensInvariantsSet,
+    OpensInvariantMask,
+    InvMaskNone,
+    InvMaskAny,
+    InvMaskList,
+    InvMaskListCompl,
+    InvMaskSet,
     NoUnwind,
     NoUnwindWhen,
 }
@@ -475,11 +476,14 @@ fn verus_items_map() -> Vec<(&'static str, VerusItem)> {
         ("verus::verus_builtin::decreases_when",          VerusItem::Spec(SpecItem::DecreasesWhen)),
         ("verus::verus_builtin::decreases_by",            VerusItem::Spec(SpecItem::DecreasesBy)),
         ("verus::verus_builtin::recommends_by",           VerusItem::Spec(SpecItem::RecommendsBy)),
-        ("verus::verus_builtin::opens_invariants_none",   VerusItem::Spec(SpecItem::OpensInvariantsNone)),
-        ("verus::verus_builtin::opens_invariants_any",    VerusItem::Spec(SpecItem::OpensInvariantsAny)),
-        ("verus::verus_builtin::opens_invariants",        VerusItem::Spec(SpecItem::OpensInvariants)),
-        ("verus::verus_builtin::opens_invariants_except", VerusItem::Spec(SpecItem::OpensInvariantsExcept)),
-        ("verus::verus_builtin::opens_invariants_set",    VerusItem::Spec(SpecItem::OpensInvariantsSet)),
+
+        ("verus::verus_builtin::opens_invariant_mask",   VerusItem::Spec(SpecItem::OpensInvariantMask)),
+
+        ("verus::verus_builtin::inv_mask_none",           VerusItem::Spec(SpecItem::InvMaskNone)),
+        ("verus::verus_builtin::inv_mask_any",            VerusItem::Spec(SpecItem::InvMaskAny)),
+        ("verus::verus_builtin::inv_mask_list",           VerusItem::Spec(SpecItem::InvMaskList)),
+        ("verus::verus_builtin::inv_mask_list_compl",     VerusItem::Spec(SpecItem::InvMaskListCompl)),
+        ("verus::verus_builtin::inv_mask_set",            VerusItem::Spec(SpecItem::InvMaskSet)),
 
         ("verus::verus_builtin::no_unwind",               VerusItem::Spec(SpecItem::NoUnwind)),
         ("verus::verus_builtin::no_unwind_when",          VerusItem::Spec(SpecItem::NoUnwindWhen)),
@@ -735,8 +739,7 @@ pub(crate) struct VerusItems {
 pub(crate) fn from_diagnostic_items(
     diagnostic_items: &rustc_hir::diagnostic_items::DiagnosticItems,
 ) -> VerusItems {
-    let verus_item_map: HashMap<&str, VerusItem> =
-        verus_items_map().iter().map(|(k, v)| (*k, v.clone())).collect();
+    let verus_item_map: HashMap<&str, VerusItem> = verus_items_map().into_iter().collect();
     let diagnostic_name_to_id = &diagnostic_items.name_to_id;
     let mut id_to_name: HashMap<DefId, VerusItem> = HashMap::new();
     let mut name_to_id: HashMap<VerusItem, DefId> = HashMap::new();

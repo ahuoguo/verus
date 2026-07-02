@@ -277,6 +277,7 @@ fn outer_reason_by_expr_kind(e: &Expr) -> Option<OuterProphReason> {
             | ExprX::BorrowMut(..)
             | ExprX::BorrowMutTracked(..)
             | ExprX::TwoPhaseBorrowMut(..)
+            | ExprX::InvMask(..)
             | ExprX::Old(..)
             | ExprX::Await(..)
         => None,
@@ -3069,6 +3070,22 @@ fn check_expr(
             }
 
             Ok((Mode::Exec, Proph::No))
+        }
+        ExprX::InvMask(mask_spec) => {
+            for expr in mask_spec.exprs().iter() {
+                let mut typing = typing.push_block_ghostness(Ghost::Ghost);
+                check_expr_has_mode(
+                    ctxt,
+                    record,
+                    &mut typing,
+                    Mode::Spec,
+                    expr,
+                    Mode::Spec,
+                    outer_proph,
+                )?;
+            }
+
+            Ok((Mode::Spec, Proph::No))
         }
         ExprX::AirStmt(_) => Ok((Mode::Exec, Proph::No)),
         ExprX::NeverToAny(e) => {
