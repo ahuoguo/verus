@@ -1,19 +1,14 @@
 #![verifier::exec_allows_no_decreases_clause]
 #![verifier::loop_isolation(false)]
 
-//! Treiber Stack
-//!
-//! Key proof technique for push freshness:
-//! - PointsTo::is_nonnull() proves new_head != 0
-//! - PointsTo::is_distinct() proves new_head not in existing map
-//!   (two live PointsTo tokens cannot share an address)
-
 use vstd::prelude::*;
 use vstd::atomic::*;
 use vstd::invariant::*;
 use vstd::simple_pptr::*;
 use vstd::resource::*;
 use vstd::resource::ghost_var::*;
+use vstd::resource::map::*;
+use vstd::shared::*;
 
 verus! {
 
@@ -22,11 +17,11 @@ pub struct Node {
     pub next: usize,
 }
 
-// TODO: Verus's size_of is uninterpreted
+// TODO: Verus's size_of is uninterpreted for user structs
 // https://github.com/verus-lang/verus/issues/2633
 global layout Node is size == 16;
 
-/// ghost link list predicate
+/// ghost linked-list predicate — the analog of `phys_list` (treiber2.v lines 88-94).
 pub open spec fn is_stack_list(
     head: usize, xs: Seq<u64>, nodes: Map<usize, Node>,
 ) -> bool
@@ -40,10 +35,6 @@ pub open spec fn is_stack_list(
         &&& is_stack_list(nodes[head].next, xs.subrange(1, xs.len() as int), nodes)
     }
 }
-
-// ============================================================================
-// Lemmas
-// ============================================================================
 
 proof fn lemma_is_stack_list_mono(
     head: usize, xs: Seq<u64>,
@@ -96,15 +87,18 @@ proof fn lemma_is_stack_list_pop(
 pub struct StackGhostState {
     pub head_perm: PermissionUsize,
     pub auth: GhostVarAuth<Seq<u64>>,
-    pub nodes: Ghost<Map<usize, Node>>,
-    // Tracked map of PointsTo tokens for ALL allocated nodes.
-    // This is the key: we can use is_distinct() against these.
-    pub perms: Map<usize, PointsTo<Node>>,
+    // Authoritative node contents. Its view (`node_map@`) is the ghost node map.
+    pub node_map: GhostMapAuth<usize, Node>,
+    // Duplicable heap-read permission per node (the `↦□` read token).
+    pub perms: Map<usize, Shared<PointsTo<Node>>>,
+    // Duplicable value-agreement fragment per node (the `↦□` value knowledge).
+    pub pers: Map<usize, GhostPersistentPointsTo<usize, Node>>,
 }
 
 pub struct StackConst {
     pub patomic_id: int,
     pub ghost_var_id: Loc,
+    pub node_map_id: Loc,
 }
 
 pub open spec const STACK_NS: int = 7777;
@@ -112,18 +106,22 @@ pub open spec const STACK_NS: int = 7777;
 pub struct StackInvPred;
 impl InvariantPredicate<StackConst, StackGhostState> for StackInvPred {
     open spec fn inv(k: StackConst, v: StackGhostState) -> bool {
-        let StackConst { patomic_id, ghost_var_id } = k;
-        let StackGhostState { head_perm, auth, nodes, perms } = v;
+        let StackConst { patomic_id, ghost_var_id, node_map_id } = k;
+        let StackGhostState { head_perm, auth, node_map, perms, pers } = v;
         &&& head_perm@.patomic == patomic_id
         &&& auth.id() == ghost_var_id
-        &&& is_stack_list(head_perm@.value, auth@, nodes@)
-        // perms agrees with nodes: same domain, same content
-        &&& perms.dom() =~= nodes@.dom()
-        &&& forall|addr: usize| #[trigger] nodes@.dom().contains(addr) ==> {
-            &&& perms[addr].pptr().addr() == addr
-            &&& perms[addr].is_init()
-            &&& perms[addr].value().val == nodes@[addr].val
-            &&& perms[addr].value().next == nodes@[addr].next
+        &&& node_map.id() == node_map_id
+        &&& is_stack_list(head_perm@.value, auth@, node_map@)
+        &&& perms.dom() =~= node_map@.dom()
+        &&& pers.dom() =~= node_map@.dom()
+        &&& forall|addr: usize| #[trigger] node_map@.dom().contains(addr) ==> {
+            // physical read token agrees with the node map
+            &&& perms[addr]@.pptr().addr() == addr
+            &&& perms[addr]@.is_init()
+            &&& perms[addr]@.value() == node_map@[addr]
+            // persistent value fragment agrees with the node map
+            &&& pers[addr].id() == node_map_id
+            &&& pers[addr]@ == (addr, node_map@[addr])
         }
     }
 }
@@ -137,6 +135,7 @@ pub struct TreiberStack {
     pub inv: Tracked<AtomicInvariant<StackConst, StackGhostState, StackInvPred>>,
 }
 
+// own γ (● Excl' xs) / own γ (◯ Excl' xs)
 pub tracked struct StackToken {
     pub inner: GhostVar<Seq<u64>>,
 }
@@ -164,16 +163,25 @@ impl TreiberStack {
     {
         let (head, Tracked(head_perm)) = PAtomicUsize::new(0);
         let tracked (gva, gv) = GhostVarAuth::<Seq<u64>>::new(Seq::empty());
-        let ghost k = StackConst { patomic_id: head.id(), ghost_var_id: gva.id() };
+        let tracked (node_map, _submap) = GhostMapAuth::<usize, Node>::new(Map::empty());
+        let ghost k = StackConst {
+            patomic_id: head.id(),
+            ghost_var_id: gva.id(),
+            node_map_id: node_map.id(),
+        };
         let tracked state = StackGhostState {
-            head_perm, auth: gva,
-            nodes: Ghost(Map::empty()),
+            head_perm, auth: gva, node_map,
             perms: Map::tracked_empty(),
+            pers: Map::tracked_empty(),
         };
         let tracked inv = AtomicInvariant::<StackConst, StackGhostState, StackInvPred>::new(k, state, STACK_NS);
         (TreiberStack { head, inv: Tracked(inv) }, Tracked(StackToken { inner: gv }))
     }
 }
+
+// ============================================================================
+// Push
+// ============================================================================
 
 impl TreiberStack {
     pub fn push(&self, val: u64)
@@ -191,100 +199,79 @@ impl TreiberStack {
         requires self.wf(),
     {
         let tracked mut au = atomic_update;
-        let mut curr;
+        let mut curr: usize;
 
         open_atomic_invariant!(self.inv.borrow() => v => {
-            let tracked StackGhostState { head_perm, auth, nodes, perms } = v;
+            let tracked StackGhostState { head_perm, auth, node_map, perms, pers } = v;
             curr = self.head.load(Tracked(&head_perm));
-            proof { v = StackGhostState { head_perm, auth, nodes, perms } }
+            proof { v = StackGhostState { head_perm, auth, node_map, perms, pers } }
         });
 
-
         loop invariant au == atomic_update, self.wf() {
-            // Allocate node via PPtr::new — gives us PointsTo<Node>
+            // Allocate + initialize the new node while we still hold its EXCLUSIVE
+            // PointsTo. This is the sole write to the node; after the CAS it is frozen.
             let node = Node { val, next: curr };
             let (node_ptr, Tracked(node_perm)) = PPtr::<Node>::new(node);
             let new_head = node_ptr.addr();
-            // Prove non-null from PointsTo type invariant
             proof { node_perm.is_nonnull(); }
             assert(new_head != 0);
 
-            match self.try_push(val, curr, new_head, node_ptr, Tracked(au), Tracked(node_perm)) {
-                None => { assert(atomic_update.resolves()); return; }
-                Some((actual, tracked_au)) => {
-                    proof { au = tracked_au.get() };
+            let tracked mut maybe_au = Some(au);
+            let tracked mut maybe_perm: Option<PointsTo<Node>> = Some(node_perm);
+            let res;
+            open_atomic_invariant!(self.inv.borrow() => v => {
+                let tracked StackGhostState { mut head_perm, mut auth, mut node_map, mut perms, mut pers } = v;
+                res = self.head.compare_exchange_weak(Tracked(&mut head_perm), curr, new_head);
+                proof {
+                    if res is Ok {
+                        let tracked au = maybe_au.tracked_take();
+                        let tracked mut np = maybe_perm.tracked_take();
+                        try_open_atomic_update!(au, mut token => {
+                            let old_seq = auth@;
+                            let old_nodes = node_map@;
+
+                            // FRESHNESS: new_head ∉ old_nodes.dom() via is_distinct against
+                            // the (shared) existing perm — two live PointsTo can't share an addr.
+                            if old_nodes.dom().contains(new_head) {
+                                assert(perms.dom().contains(new_head));
+                                let tracked existing = perms.tracked_borrow(new_head).borrow();
+                                np.is_distinct(existing);
+                                assert(false);
+                            }
+                            assert(!old_nodes.dom().contains(new_head));
+
+                            // Update the abstract stack (auth ● / token ◯ together).
+                            let new_seq = seq![val].add(old_seq);
+                            auth.update(&mut token.inner, new_seq);
+
+                            // Extend the authoritative node map and derive a *persistent*,
+                            // duplicable value fragment for the new node.
+                            let ni = Node { val, next: curr };
+                            let tracked pts = node_map.insert(new_head, ni);
+                            let tracked ppts = pts.persist();
+                            pers.tracked_insert(new_head, ppts);
+
+                            // Freeze the node's PointsTo into a duplicable Shared (↦□ read).
+                            let tracked shared = Shared::new(np);
+                            perms.tracked_insert(new_head, shared);
+
+                            lemma_is_stack_list_push(curr, new_head, val, old_seq, old_nodes, ni);
+                            Tracked(Ok(Commit(token)))
+                        });
+                    }
+                    v = StackGhostState { head_perm, auth, node_map, perms, pers };
+                }
+            });
+
+            match res {
+                Ok(_) => { assert(atomic_update.resolves()); return; }
+                Err(actual) => {
+                    proof { au = maybe_au.tracked_take() };
                     curr = actual;
                 }
             }
         }
     }
-
-    fn try_push(&self, val: u64, expected: usize, new_head: usize, node_ptr: PPtr<Node>,
-        Tracked(au): Tracked<PushAU>, Tracked(node_perm): Tracked<PointsTo<Node>>)
-        -> (out: Option<(usize, Tracked<PushAU>)>)
-        requires
-            self.wf(), au.pred().args(self, val),
-            new_head != 0,
-            node_perm.pptr() == node_ptr,
-            node_perm.pptr().addr() == new_head,
-            node_perm.is_init(),
-            node_perm.value().val == val,
-            node_perm.value().next == expected,
-        ensures match out {
-            None => au.resolves(),
-            Some((_, tracked_au)) => tracked_au@ == au,
-        }
-    {
-        let tracked mut maybe_au = Some(au);
-        let tracked mut maybe_perm: Option<PointsTo<Node>> = Some(node_perm);
-        let res;
-        open_atomic_invariant!(self.inv.borrow() => v => {
-            let tracked StackGhostState { mut head_perm, mut auth, mut nodes, mut perms } = v;
-            res = self.head.compare_exchange_weak(Tracked(&mut head_perm), expected, new_head);
-            proof {
-                if res is Ok {
-                    let tracked au = maybe_au.tracked_take();
-                    let tracked mut np = maybe_perm.tracked_take();
-                    try_open_atomic_update!(au, mut token => {
-                        let old_seq = auth@;
-                        let old_nodes = nodes@;
-
-                        // PROVE FRESHNESS: new_head is NOT in old_nodes.dom()
-                        // Argument: if it were, perms[new_head] would exist with
-                        // .pptr().addr() == new_head. But np also has .pptr().addr() == new_head.
-                        // Two live PointsTo tokens can't have the same address.
-                        if old_nodes.dom().contains(new_head) {
-                            // perms[new_head] exists and has addr == new_head
-                            assert(perms.dom().contains(new_head));
-                            let tracked existing = perms.tracked_borrow(new_head);
-                            np.is_distinct(existing);
-                            // np.addr() != existing.addr() -- but both == new_head
-                            assert(false);
-                        }
-                        assert(!old_nodes.dom().contains(new_head));
-
-                        // Update ghost state
-                        let new_seq = seq![val].add(old_seq);
-                        auth.update(&mut token.inner, new_seq);
-                        let ni = Node { val, next: expected };
-                        nodes = Ghost(old_nodes.insert(new_head, ni));
-                        perms.tracked_insert(new_head, np);
-                        lemma_is_stack_list_push(expected, new_head, val, old_seq, old_nodes, ni);
-                        Tracked(Ok(Commit(token)))
-                    });
-                }
-                v = StackGhostState { head_perm, auth, nodes, perms };
-            }
-        });
-        match res {
-            Ok(_) => None,
-            Err(actual) => Some((actual, Tracked(maybe_au.tracked_take()))),
-        }
-    }
-
-    // ========================================================================
-    // Pop (sketch — node read still requires persistent PointsTo)
-    // ========================================================================
 
     pub fn pop(&self) -> (out: Option<u64>)
         atomically (atomic_update) {
@@ -303,104 +290,106 @@ impl TreiberStack {
         requires self.wf(),
     {
         let tracked mut au = atomic_update;
-        let mut curr;
-
-        open_atomic_invariant!(self.inv.borrow() => v => {
-            let tracked StackGhostState { head_perm, auth, nodes, perms } = v;
-            curr = self.head.load(Tracked(&head_perm));
-            proof { v = StackGhostState { head_perm, auth, nodes, perms } }
-        });
 
         loop invariant au == atomic_update, self.wf() {
-            if curr == 0 {
-                match self.try_pop_empty(Tracked(au)) {
-                    None => { assert(atomic_update.resolves()); return None; }
-                    Some((actual, tracked_au)) => {
-                        proof { au = tracked_au.get() };
-                        curr = actual;
+            let mut curr: usize;
+            let tracked mut maybe_au = Some(au);
+            // Cloned-out read token and value fragment for the node at `curr`.
+            let tracked mut maybe_shared: Option<Shared<PointsTo<Node>>> = None;
+            let tracked mut maybe_pers: Option<GhostPersistentPointsTo<usize, Node>> = None;
+
+            let empty;
+            open_atomic_invariant!(self.inv.borrow() => v => {
+                let tracked StackGhostState { head_perm, mut auth, node_map, perms, pers } = v;
+                curr = self.head.load(Tracked(&head_perm));
+                empty = curr == 0;
+                proof {
+                    if curr == 0 {
+                        // Empty pop linearizes at the load (treiber2.v lines 343-353):
+                        // is_stack_list(0, auth@, _) => auth@.len() == 0.
+                        let tracked au = maybe_au.tracked_take();
+                        try_open_atomic_update!(au, token => {
+                            auth.agree(&token.inner);
+                            Tracked(Ok(Commit(token)))
+                        });
+                    } else {
+                        // curr != 0 and is_stack_list(curr, auth@, node_map@) => curr ∈ dom.
+                        assert(node_map@.dom().contains(curr));
+                        // Clone the duplicable read token and value fragment out of the
+                        // invariant — leaving it intact (both are duplicable, i.e. ↦□).
+                        maybe_shared = Some(perms.tracked_borrow(curr).clone());
+                        maybe_pers = Some(pers.tracked_borrow(curr).duplicate());
                     }
+                    v = StackGhostState { head_perm, auth, node_map, perms, pers };
                 }
-            } else {
-                // TODO: Reading node requires persistent/fractional PointsTo.
-                // For now, model with assume for the speculative read.
-                let node_val: u64;
-                let next: usize;
-                assume(false); // node read
-                node_val = 0;
-                next = 0;
+            });
 
-                match self.try_pop_nonempty(curr, next, node_val, Tracked(au)) {
-                    None => { assert(atomic_update.resolves()); return Some(node_val); }
-                    Some((actual, tracked_au)) => {
-                        proof { au = tracked_au.get() };
-                        curr = actual;
+            if empty {
+                assert(atomic_update.resolves());
+                return None;
+            }
+            proof { au = maybe_au.tracked_take(); }
+
+            // Read the node THROUGH the cloned Shared perm — outside any invariant,
+            // exactly like reading `ℓ ↦□ (x, r)` in Iris (treiber2.v line 310).
+            let tracked my_shared = maybe_shared.tracked_take();
+            let tracked my_pers = maybe_pers.tracked_take();
+            let head_ptr = PPtr::<Node>::from_addr(curr);
+            let node_val;
+            let next;
+            {
+                let tracked perm_ref = my_shared.borrow();
+                let node_ref = head_ptr.borrow(Tracked(perm_ref));
+                node_val = node_ref.val;
+                next = node_ref.next;
+            }
+            // The value fragment we carry pins the node contents we just read.
+            let ghost expected = my_pers@.1;
+            assert(my_pers.key() == curr);
+            assert(node_val == expected.val);
+            assert(next == expected.next);
+
+            let tracked mut maybe_au = Some(au);
+            let res;
+            open_atomic_invariant!(self.inv.borrow() => v => {
+                let tracked StackGhostState { mut head_perm, mut auth, node_map, perms, pers } = v;
+                let ghost pre_head = head_perm@.value;
+                res = self.head.compare_exchange_weak(Tracked(&mut head_perm), curr, next);
+                proof {
+                    if res is Ok {
+                        // CAS success => head was curr (!= 0), so curr ∈ dom(node_map@).
+                        assert(pre_head == curr);
+                        assert(node_map@.dom().contains(curr));
+                        // pointsto_agree (treiber2.v line 330): the persistent value
+                        // fragment agrees with the CURRENT authoritative node map, so the
+                        // values we read equal node_map@[curr] — no immutability axiom.
+                        my_pers.agree(&node_map);
+                        assert(node_map@[curr] == expected);
+                        assert(node_map@[curr].next == next);
+                        assert(node_map@[curr].val == node_val);
+
+                        let tracked au = maybe_au.tracked_take();
+                        try_open_atomic_update!(au, mut token => {
+                            let old_seq = auth@;
+                            lemma_is_stack_list_pop(curr, old_seq, node_map@);
+                            let new_seq = old_seq.subrange(1, old_seq.len() as int);
+                            auth.update(&mut token.inner, new_seq);
+                            Tracked(Ok(Commit(token)))
+                        });
                     }
+                    v = StackGhostState { head_perm, auth, node_map, perms, pers };
+                }
+            });
+
+            match res {
+                Ok(_) => {
+                    assert(atomic_update.resolves());
+                    return Some(node_val);
+                }
+                Err(_) => {
+                    proof { au = maybe_au.tracked_take() };
                 }
             }
-        }
-    }
-
-    fn try_pop_empty(&self, Tracked(au): Tracked<PopAU>)
-        -> (out: Option<(usize, Tracked<PopAU>)>)
-        requires self.wf(), au.pred().args(self),
-        ensures match out { None => au.resolves(), Some((_, t)) => t@ == au }
-    {
-        let tracked mut maybe_au = Some(au);
-        let res;
-        open_atomic_invariant!(self.inv.borrow() => v => {
-            let tracked StackGhostState { mut head_perm, mut auth, nodes, perms } = v;
-            res = self.head.compare_exchange_weak(Tracked(&mut head_perm), 0, 0);
-            proof {
-                if res is Ok {
-                    let tracked au = maybe_au.tracked_take();
-                    try_open_atomic_update!(au, token => {
-                        auth.agree(&token.inner);
-                        Tracked(Ok(Commit(token)))
-                    });
-                }
-                v = StackGhostState { head_perm, auth, nodes, perms };
-            }
-        });
-        match res {
-            Ok(_) => None,
-            Err(actual) => Some((actual, Tracked(maybe_au.tracked_take()))),
-        }
-    }
-
-    fn try_pop_nonempty(&self, expected: usize, next: usize, node_val: u64,
-        Tracked(au): Tracked<PopAU>)
-        -> (out: Option<(usize, Tracked<PopAU>)>)
-        requires self.wf(), au.pred().args(self), expected != 0,
-        ensures match out { None => au.resolves(), Some((_, t)) => t@ == au }
-    {
-        let tracked mut maybe_au = Some(au);
-        let res;
-        open_atomic_invariant!(self.inv.borrow() => v => {
-            let tracked StackGhostState { mut head_perm, mut auth, mut nodes, perms } = v;
-            res = self.head.compare_exchange_weak(Tracked(&mut head_perm), expected, next);
-            proof {
-                if res is Ok {
-                    // Connection between physical read and ghost state:
-                    // nodes are never modified, so what we read is still valid.
-                    assume(nodes@.dom().contains(expected));
-                    assume(nodes@[expected].next == next);
-                    assume(nodes@[expected].val == node_val);
-
-                    let tracked au = maybe_au.tracked_take();
-                    try_open_atomic_update!(au, mut token => {
-                        let old_seq = auth@;
-                        lemma_is_stack_list_pop(expected, old_seq, nodes@);
-                        let new_seq = old_seq.subrange(1, old_seq.len() as int);
-                        auth.update(&mut token.inner, new_seq);
-                        Tracked(Ok(Commit(token)))
-                    });
-                }
-                v = StackGhostState { head_perm, auth, nodes, perms };
-            }
-        });
-        match res {
-            Ok(_) => None,
-            Err(actual) => Some((actual, Tracked(maybe_au.tracked_take()))),
         }
     }
 }
