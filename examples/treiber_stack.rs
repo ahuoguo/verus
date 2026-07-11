@@ -161,9 +161,7 @@ pub struct Node {
 global layout Node is size == 16;
 
 /// ghost linked-list predicate
-pub open spec fn is_stack_list(
-    head: usize, xs: Seq<u64>, nodes: Map<usize, Node>,
-) -> bool
+pub open spec fn is_stack_list(head: usize, xs: Seq<u64>, nodes: Map<usize, Node>) -> bool
     decreases xs.len(),
 {
     if xs.len() == 0 { head == 0 }
@@ -176,8 +174,10 @@ pub open spec fn is_stack_list(
 }
 
 proof fn lemma_is_stack_list_mono(
-    head: usize, xs: Seq<u64>,
-    nodes: Map<usize, Node>, nodes2: Map<usize, Node>,
+    head: usize,
+    xs: Seq<u64>,
+    nodes: Map<usize, Node>,
+    nodes2: Map<usize, Node>,
 )
     requires
         is_stack_list(head, xs, nodes),
@@ -194,30 +194,27 @@ proof fn lemma_is_stack_list_mono(
 }
 
 proof fn lemma_is_stack_list_push(
-    old_head: usize, new_head: usize, val: u64,
-    xs: Seq<u64>, nodes: Map<usize, Node>, ni: Node,
+    old_head: usize, new_head: usize, 
+    val: u64,
+    xs: Seq<u64>,
+    nodes: Map<usize, Node>, 
+    new_node: Node,
 )
     requires
-        new_head != 0, !nodes.dom().contains(new_head),
+        new_head != 0, 
+        !nodes.dom().contains(new_head),
         is_stack_list(old_head, xs, nodes),
-        ni.val == val, ni.next == old_head,
-    ensures is_stack_list(new_head, seq![val].add(xs), nodes.insert(new_head, ni)),
+        new_node.val == val,
+        new_node.next == old_head,
+    ensures 
+        is_stack_list(new_head, seq![val].add(xs), nodes.insert(new_head, new_node)),
 {
-    let new_nodes = nodes.insert(new_head, ni);
+    let new_nodes = nodes.insert(new_head, new_node);
     assert forall|k: usize| #[trigger] nodes.dom().contains(k)
         implies new_nodes.dom().contains(k) && new_nodes[k] == nodes[k] by {}
     lemma_is_stack_list_mono(old_head, xs, nodes, new_nodes);
     assert(seq![val].add(xs).subrange(1, seq![val].add(xs).len() as int) =~= xs);
 }
-
-proof fn lemma_is_stack_list_pop(
-    head: usize, xs: Seq<u64>, nodes: Map<usize, Node>,
-)
-    requires is_stack_list(head, xs, nodes), xs.len() > 0,
-    ensures
-        is_stack_list(nodes[head].next, xs.subrange(1, xs.len() as int), nodes),
-        nodes[head].val == xs[0],
-{}
 
 // Well-formedness of one merged node token at address `addr`, against node map `m`.
 // encoding `ℓ ↦□ (x, to_val r)`
@@ -253,9 +250,10 @@ pub struct StackInv {
     // TODO: explain why `node_map` is not duplicate information since there's also `toks`
     pub node_map: GhostMapAuth<usize, Node>,
     // One duplicable token per node = the Verus reconstruction of `ℓ ↦□ (x, r)`:
-    //   .0 : PointsTo<Node>                    -- physical read capability (the ↦ part)
-    //   .1 : GhostPersistentPointsTo<...>      -- persistent value fragment of node_map (the □ part)
+    //   .0 : PointsTo<Node>                    - physical read capability (the ↦ part)
+    //   .1 : GhostPersistentPointsTo<...>      - persistent value fragment of node_map (the □ part)
     // `Shared<_>` gives the duplicability that `↦□`'s persistence provides.
+    // the `PointsTo` here is used to for distinctness,
     pub toks: Map<usize, Shared<(PointsTo<Node>, GhostPersistentPointsTo<usize, Node>)>>,
 }
 
@@ -352,9 +350,10 @@ impl TreiberStack {
 impl TreiberStack {
     pub fn push(&self, val: u64)
         atomically (atomic_update) {
-            (token: StackContent)
-                -> (res: Result<Commit<StackContent>, (StackContent, OpenInvariantCredit)>),
-            requires token.id() == self.ghost_var_id(),
+            // TODO: is there a better name than token...?
+            (token: StackContent) -> (res: Result<Commit<StackContent>, (StackContent, OpenInvariantCredit)>),
+            requires 
+                token.id() == self.ghost_var_id(),
             ensures match res {
                 Err((t, _)) => t == token,
                 Ok(commit) => commit@.id() == token.id() && commit@@ =~= seq![val].add(token@),
@@ -366,60 +365,63 @@ impl TreiberStack {
     {
         let tracked mut au = atomic_update;
         let mut head: usize;
-
-        open_atomic_invariant!(self.inv.borrow() => v => {
+        
+        // let: "old_head" := !"stack" in
+        // note: instead of recursion, we load old_hold from CAS directly
+        open_atomic_invariant!(&self.inv => v => {
             let tracked StackInv { head_perm, auth, node_map, toks } = v;
-            // let: "old_head" := !"stack" in
             head = self.head.load(Tracked(&head_perm));
             proof { v = StackInv { head_perm, auth, node_map, toks } }
         });
 
         loop invariant au == atomic_update, self.wf() {
+            // let: "cell" := ("elt", "old_head") in
             let node = Node { val, next: head };
+            // (SOME (ref "cell"))
             let (node_ptr, Tracked(node_perm)) = PPtr::<Node>::new(node);
             let new_head = node_ptr.addr();
             proof { node_perm.is_nonnull(); }
-            assert(new_head != 0);
 
             let tracked mut maybe_au = Some(au);
             let tracked mut maybe_perm: Option<PointsTo<Node>> = Some(node_perm);
-            let res;
-            open_atomic_invariant!(self.inv.borrow() => v => {
+            let res: Result<usize, usize>;
+
+            open_atomic_invariant!(&self.inv => v => {
                 let tracked StackInv { mut head_perm, mut auth, mut node_map, mut toks } = v;
+                // CAS "stack" "old_head" (SOME (ref "cell"))
                 res = self.head.compare_exchange_weak(Tracked(&mut head_perm), head, new_head);
                 proof {
                     if res is Ok {
                         let tracked au = maybe_au.tracked_take();
                         let tracked mut np = maybe_perm.tracked_take();
-                        try_open_atomic_update!(au, mut token => {
-                            // authority and the client fragment agree (● xs ∗ ◯ ys ⊢ xs = ys)
-                            auth_agree(&mut auth, &token.cont);
-                            let old_seq = auth.view();
-                            let old_nodes = node_map@;
 
-                            // FRESHNESS via is_distinct against the existing read token.
+                        try_open_atomic_update!(au, mut token => {
+                            // library and the client agree (● xs ∗ ◯ ys ⊢ xs = ys)
+                            let old_seq = auth@;
+                            let old_nodes = node_map@;
+                            auth_agree(&mut auth, &token.cont);
+                            assert(old_seq =~= token.cont@);
+
                             if old_nodes.dom().contains(new_head) {
                                 assert(toks.dom().contains(new_head));
                                 let tracked pair = toks.tracked_borrow(new_head).borrow();
                                 np.is_distinct(&pair.0);
                                 assert(false);
                             }
+                            // TODO: I hope I can use assert_by, but it doesn't work
                             assert(!old_nodes.dom().contains(new_head));
 
-                            // abstract update (● / ◯ together)
+                            // ghost update for ghost_var_id (StackAuth/StackFrag)
                             let new_seq = seq![val].add(old_seq);
                             auth_update(&mut auth, &mut token.cont, new_seq);
 
-                            // extend authority, mint a persistent value fragment
-                            let ni = Node { val, next: head };
-                            let tracked pts = node_map.insert(new_head, ni);
+                            // after this point, we will never need write permission
+                            let tracked pts = node_map.insert(new_head, node);
                             let tracked ppts = pts.persist();
-
-                            // bundle read token + value fragment into ONE duplicable token
                             let tracked shared = Shared::new((np, ppts));
                             toks.tracked_insert(new_head, shared);
 
-                            lemma_is_stack_list_push(head, new_head, val, old_seq, old_nodes, ni);
+                            lemma_is_stack_list_push(head, new_head, val, old_seq, old_nodes, node);
                             Tracked(Ok(Commit(token)))
                         });
                     }
@@ -428,9 +430,15 @@ impl TreiberStack {
             });
 
             match res {
-                Ok(_) => { assert(atomic_update.resolves()); return; }
+                Ok(_) => return,
                 Err(actual) => {
                     proof { au = maybe_au.tracked_take() };
+                    // TODO: an interesting thing for having 
+                    // #![verifier::exec_allows_no_decreases_clause]
+                    // is that if we remove the line below we actually can easily get
+                    // into starvation, though we can't catch that
+                    // (have to switch to some sort of fair operational semantics to really deal with this)
+                    // an interesting empirical thing to try out...
                     head = actual;
                 }
             }
@@ -439,9 +447,9 @@ impl TreiberStack {
 
     pub fn pop(&self) -> (out: Option<u64>)
         atomically (atomic_update) {
-            (token: StackContent)
-                -> (res: Result<Commit<StackContent>, (StackContent, OpenInvariantCredit)>),
-            requires token.id() == self.ghost_var_id(),
+            (token: StackContent) -> (res: Result<Commit<StackContent>, (StackContent, OpenInvariantCredit)>),
+            requires
+                token.id() == self.ghost_var_id(),
             ensures match res {
                 Err((t, _)) => t == token,
                 Ok(commit) => commit@.id() == token.id()
@@ -460,11 +468,12 @@ impl TreiberStack {
             let tracked mut maybe_au = Some(au);
             let tracked mut maybe_tok: Option<Shared<(PointsTo<Node>, GhostPersistentPointsTo<usize, Node>)>> = None;
 
-            let empty;
-            open_atomic_invariant!(self.inv.borrow() => v => {
+            open_atomic_invariant!(&self.inv => v => {
                 let tracked StackInv { head_perm, mut auth, node_map, toks } = v;
+                
+                // let: "old_top" := !"stack" in
                 head = self.head.load(Tracked(&head_perm));
-                empty = head == 0;
+                
                 proof {
                     if head == 0 {
                         let tracked au = maybe_au.tracked_take();
@@ -473,55 +482,45 @@ impl TreiberStack {
                             Tracked(Ok(Commit(token)))
                         });
                     } else {
-                        assert(node_map@.dom().contains(head));
-                        // ONE clone gives both the read capability and the value fragment.
+                        // clone gives both the read capability and the value fragment.
                         maybe_tok = Some(toks.tracked_borrow(head).clone());
                     }
                     v = StackInv { head_perm, auth, node_map, toks };
                 }
             });
 
-            if empty {
-                assert(atomic_update.resolves());
+            if head == 0 {
                 return None;
             }
             proof { au = maybe_au.tracked_take(); }
 
-            // Read the node THROUGH the cloned token's read permission (↦□ read).
             let tracked head_tok = maybe_tok.tracked_take();
             let head_ptr = PPtr::<Node>::from_addr(head);
-            let node_val;
-            let next;
-            {
-                let tracked pair = head_tok.borrow();
-                let node_ref = head_ptr.borrow(Tracked(&pair.0));
-                node_val = node_ref.val;
-                next = node_ref.next;
-            }
-            assert(node_val == head_tok@.0.value().val);
-            assert(next == head_tok@.0.value().next);
+            let tracked pair = head_tok.borrow();
+
+            // let: "cell" := !"p" in
+            let Node {val: node_val, next: next} = *head_ptr.borrow(Tracked(&pair.0));
 
             let tracked mut maybe_au = Some(au);
             let res;
-            open_atomic_invariant!(self.inv.borrow() => v => {
+            open_atomic_invariant!(&self.inv => v => {
                 let tracked StackInv { mut head_perm, mut auth, node_map, toks } = v;
-                let ghost pre_head = head_perm@.value;
+
+                // CAS "stack" "old_top" (Snd "cell") 
                 res = self.head.compare_exchange_weak(Tracked(&mut head_perm), head, next);
+
                 proof {
                     if res is Ok {
-                        assert(pre_head == head);
-                        assert(node_map@.dom().contains(head));
                         let tracked pair = head_tok.borrow();
+                        // TODO: only place where we need `GhostPersistentPointsTo`
                         pair.1.agree(&node_map);
                         assert(node_map@[head] == head_tok@.0.value());
-                        assert(node_map@[head].next == next);
-                        assert(node_map@[head].val == node_val);
 
                         let tracked au = maybe_au.tracked_take();
                         try_open_atomic_update!(au, mut token => {
+                            // update ghost state
                             auth_agree(&mut auth, &token.cont);
                             let old_seq = auth.view();
-                            lemma_is_stack_list_pop(head, old_seq, node_map@);
                             let new_seq = old_seq.subrange(1, old_seq.len() as int);
                             auth_update(&mut auth, &mut token.cont, new_seq);
                             Tracked(Ok(Commit(token)))
@@ -532,10 +531,7 @@ impl TreiberStack {
             });
 
             match res {
-                Ok(_) => {
-                    assert(atomic_update.resolves());
-                    return Some(node_val);
-                }
+                Ok(_) => return Some(node_val),
                 Err(_) => {
                     proof { au = maybe_au.tracked_take() };
                 }
